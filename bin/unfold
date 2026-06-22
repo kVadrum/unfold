@@ -1,0 +1,380 @@
+#!/usr/bin/env bash
+# unfold — resolve a Claude Code CLAUDE.md @import chain into the single
+# flattened instruction set a session actually inherits.
+#
+# Claude Code lets a CLAUDE.md pull in other files with `@path` imports,
+# recursively, up to a depth limit. A three-line project CLAUDE.md that just
+# imports a shared base file and a per-machine device file looks tiny — but
+# what the model actually reads is the union of all of them, inlined in order.
+# unfold prints that union, with provenance markers showing where each block
+# came from, so you can read it, grep it, and diff it.
+#
+# Zero dependencies: bash, plus coreutils that ship everywhere (wc, dirname).
+# Read-only. Never writes, never touches the network.
+
+set -uo pipefail
+
+VERSION="0.2.0"
+
+# ── options / defaults ─────────────────────────────────────────────────────
+BARE=0          # --bare: emit only resolved content, no provenance markers
+FOOTER=1        # --no-footer: suppress the size/token summary
+MAX_DEPTH=5     # --max-depth N: Claude Code's own default is 5
+MAX_FILES=1000  # --max-files N: cap total import expansions (amplification guard)
+MAX_BYTES=$((50 * 1024 * 1024))  # --max-bytes N: cap cumulative inlined bytes
+NO_ESCAPE=0     # --no-escape: refuse imports that resolve outside the root dir
+STRICT=0        # --strict: nonzero exit if anything is missing/cyclic/too deep
+TARGET=""       # the root file (or dir holding CLAUDE.md)
+
+# ── accumulated state ───────────────────────────────────────────────────────
+declare -A ON_PATH=()      # canonical path -> 1 while it's an ancestor (cycle guard)
+REPORT=()                  # footer rows: "depth<TAB>label<TAB>chars<TAB>bytes"
+ROOT_DIR=""                # canonical dir of the root file — confinement boundary
+TOTAL_CHARS=0
+TOTAL_BYTES=0
+FILE_COUNT=0               # imports expanded so far (amplification budget)
+BUDGET_HIT=0               # set once a budget cap trips, to stop + warn once
+WARN_COUNT=0               # missing/cycle/max-depth/escape/blocked/budget events
+
+usage() {
+  cat <<'EOF'
+unfold — flatten a Claude Code CLAUDE.md @import chain
+
+USAGE:
+  unfold [OPTIONS] [FILE|DIR]
+
+  FILE   a CLAUDE.md (or any markdown using @imports). Default: ./CLAUDE.md
+  DIR    a directory; unfold reads <DIR>/CLAUDE.md
+
+OPTIONS:
+  --bare            emit only the resolved content, no provenance markers
+                    (the literal bytes a session inherits)
+  --no-footer       suppress the size / token summary footer
+  --max-depth N     max import recursion depth (default 5, matches Claude Code)
+  --max-files N     cap total import expansions (default 1000); guards against
+                    a small chain fanning out into a huge one
+  --max-bytes N     cap cumulative inlined bytes (default 50 MiB)
+  --no-escape       refuse any import that resolves outside the root file's
+                    directory (default: inline it but warn)
+  --strict          exit 2 if any import is missing, cyclic, too deep, escapes
+                    the root, is blocked, or a budget cap is hit
+  -h, --help        show this help
+  --version         print version
+
+OUTPUT:
+  Provenance markers are HTML comments (<!-- unfold:... -->) so the default
+  output is still valid markdown. Imports inside fenced code blocks or
+  inline-code spans are left untouched, and an @ preceded by a non-space
+  (e.g. an email address) is not treated as an import.
+
+SECURITY (when resolving a CLAUDE.md you did not write):
+  unfold reads and inlines whatever the imports point at, mirroring Claude
+  Code — including absolute and ~ paths. On an untrusted chain that can reach
+  outside the project (@/etc/passwd, @~/.ssh/...); such imports are inlined
+  but flagged with a `unfold:escape` marker + stderr warning, or refused with
+  --no-escape. Pseudo-filesystem paths (/proc, /sys, /dev) are always refused.
+  Provenance markers prove import STRUCTURE, not content authorship: imported
+  content is shown verbatim (any literal `<!-- unfold:` in content is defanged
+  in marker mode, but not under --bare). Treat resolved output of an untrusted
+  chain as untrusted; don't render it as HTML unreviewed.
+
+EXIT:
+  0  resolved (warnings, if any, go to stderr)
+  1  usage error / root file not found
+  2  --strict and at least one import was missing / cyclic / too deep /
+     escaping / blocked / over budget
+EOF
+}
+
+die() { printf 'unfold: %s\n' "$1" >&2; exit 1; }
+warn() { printf 'unfold: %s\n' "$1" >&2; WARN_COUNT=$((WARN_COUNT + 1)); }
+
+# Canonicalize a path for cycle detection: expand ~, make absolute, normalize
+# the directory via cd+pwd. Falls back to the raw path if the dir is missing
+# (e.g. a not-yet-existing import target).
+canon() {
+  local p="$1" dir base out
+  case "$p" in
+    "~")    p="$HOME" ;;
+    "~/"*)  p="$HOME/${p#\~/}" ;;
+  esac
+  # Resolve symlinks + normalize so the same file reached via different names
+  # (a symlinked import) yields one cycle key instead of being inlined twice.
+  # readlink -f also canonicalizes a not-yet-existing final component as long
+  # as its parent dir exists; fall back to dir-normalization otherwise.
+  if out=$(readlink -f "$p" 2>/dev/null) && [ -n "$out" ]; then
+    printf '%s' "$out"
+    return
+  fi
+  dir=$(dirname "$p")
+  base=$(basename "$p")
+  if dir=$(cd "$dir" 2>/dev/null && pwd -P); then
+    printf '%s/%s' "$dir" "$base"
+  else
+    printf '%s' "$p"
+  fi
+}
+
+# Resolve an @import path against the directory of the file that imported it.
+resolve_import() {
+  local path="$1" base_dir="$2"
+  case "$path" in
+    "~"|"~/"*) printf '%s' "$path" ;;        # home-relative; canon expands it
+    /*)        printf '%s' "$path" ;;        # absolute
+    *)         printf '%s/%s' "$base_dir" "$path" ;;  # relative to importer
+  esac
+}
+
+marker() { [ "$BARE" -eq 1 ] || printf '%s\n' "$1"; }
+
+# Sanitize a path before putting it inside a provenance marker. A crafted
+# filename can contain ", <, >, or control bytes and break out of the HTML
+# comment (-->) or forge a marker; neutralize those so a marker stays
+# well-formed and can't be spoofed via a filename.
+msan() {
+  local s="$1"
+  s="${s//$'\n'/ }"; s="${s//$'\r'/ }"; s="${s//$'\t'/ }"
+  s="${s//[[:cntrl:]]/}"
+  s="${s//</_}"; s="${s//>/_}"; s="${s//\"/_}"
+  printf '%s' "$s"
+}
+
+# Emit a content line. In marker mode, defang any line that mimics an unfold
+# marker so attacker-controlled file content can't forge provenance (markers
+# prove import structure; content is otherwise passed through verbatim).
+put_content() {
+  if [ "$BARE" -eq 0 ]; then
+    case "$1" in
+      *'<!-- unfold:'*) printf '%s\n' "${1//<!-- unfold:/<!-- unfold-content:}"; return ;;
+    esac
+  fi
+  printf '%s\n' "$1"
+}
+
+# True (0) if a canonical path is outside the confinement root dir.
+outside_root() { case "$1/" in "$ROOT_DIR"/*) return 1 ;; *) return 0 ;; esac; }
+
+# True (0) if a canonical path is in a pseudo-filesystem (live process / device
+# state) — never a legitimate CLAUDE.md import, always refused.
+is_pseudo_fs() {
+  case "$1" in /proc|/proc/*|/sys|/sys/*|/dev|/dev/*) return 0 ;; *) return 1 ;; esac
+}
+
+# Record a file's size for the footer.
+account() {
+  local depth="$1" label="$2" file="$3" chars bytes
+  chars=$(wc -m <"$file" 2>/dev/null | tr -d ' ') || chars=0
+  bytes=$(wc -c <"$file" 2>/dev/null | tr -d ' ') || bytes=0
+  : "${chars:=0}" "${bytes:=0}"
+  REPORT+=("$depth	$label	$chars	$bytes")
+  TOTAL_CHARS=$((TOTAL_CHARS + chars))
+  TOTAL_BYTES=$((TOTAL_BYTES + bytes))
+}
+
+# Is `@<path>` at byte offset within an inline-code span? Heuristic: count
+# backticks in the line text preceding the @; odd => inside `...`.
+in_inline_code() {
+  local prefix="$1" ticks
+  ticks=${prefix//[^\`]/}
+  [ $(( ${#ticks} % 2 )) -eq 1 ]
+}
+
+# Expand one line that may contain @imports. Emits literal segments and
+# recurses into imports. Assumes caller has handled fenced-code state.
+# An own-line import (`@path` alone) expands cleanly with no injected blank
+# lines; an inline import (`see @path here`) keeps the surrounding prose.
+expand_line() {
+  local line="$1" depth="$2" base_dir="$3"
+  local emitted="" rest="$line" found=0
+
+  while [[ $rest =~ (^|[[:space:]])@([^[:space:]]+) ]]; do
+    local ws="${BASH_REMATCH[1]}" path="${BASH_REMATCH[2]}"
+    local token="${BASH_REMATCH[0]}"
+    local before="${rest%%"$token"*}"
+
+    if in_inline_code "$emitted$before"; then
+      # @ sits inside a `code span` — not an import. Keep scanning past it.
+      emitted+="$before$ws@"
+      rest="${path}${rest#*"$token"}"
+      continue
+    fi
+
+    found=1
+    local prefix="$emitted$before$ws"
+    [ -n "${prefix//[[:space:]]/}" ] && put_content "$prefix"
+    emitted=""
+    expand_import "$path" "$depth" "$base_dir"
+    rest="${rest#*"$token"}"
+  done
+
+  if [ "$found" -eq 0 ]; then
+    put_content "$line"
+  elif [ -n "${rest//[[:space:]]/}" ]; then
+    put_content "$emitted$rest"
+  fi
+}
+
+# Resolve and inline a single @import.
+expand_import() {
+  local path="$1" parent_depth="$2" base_dir="$3"
+  local depth=$((parent_depth + 1))
+  local mp; mp=$(msan "$path")
+
+  # Once a budget cap has tripped, short-circuit every further import cheaply.
+  if [ "$BUDGET_HIT" -eq 1 ]; then
+    marker "<!-- unfold:budget path=\"$mp\" — expansion budget reached, not expanded -->"
+    return
+  fi
+
+  local resolved canonical
+  resolved=$(resolve_import "$path" "$base_dir")
+  canonical=$(canon "$resolved")
+
+  if [ "$depth" -gt "$MAX_DEPTH" ]; then
+    marker "<!-- unfold:max-depth path=\"$mp\" — depth $depth exceeds --max-depth $MAX_DEPTH, not expanded -->"
+    warn "max-depth $MAX_DEPTH reached at @$path (not expanded)"
+    return
+  fi
+  if [ -n "${ON_PATH[$canonical]:-}" ]; then
+    marker "<!-- unfold:cycle path=\"$mp\" — already in import path, not re-expanded -->"
+    warn "cycle: @$path is already an ancestor (not re-expanded)"
+    return
+  fi
+  # Pseudo-filesystem paths leak live process/device state; never legitimate.
+  if is_pseudo_fs "$canonical"; then
+    marker "<!-- unfold:blocked path=\"$mp\" — pseudo-filesystem path refused -->"
+    warn "blocked: @$path resolves into a pseudo-filesystem ($canonical) — refused"
+    return
+  fi
+  # An import resolving outside the root dir is an exfiltration vector when the
+  # chain is untrusted. Warn (default, faithful to Claude Code) or refuse.
+  if outside_root "$canonical"; then
+    if [ "$NO_ESCAPE" -eq 1 ]; then
+      marker "<!-- unfold:blocked path=\"$mp\" — resolves outside root, refused (--no-escape) -->"
+      warn "blocked: @$path resolves outside the root dir ($canonical) — refused (--no-escape)"
+      return
+    fi
+    marker "<!-- unfold:escape path=\"$mp\" — resolves outside root ($canonical) -->"
+    warn "escape: @$path resolves outside the root dir ($canonical) — inlined anyway (--no-escape to refuse)"
+  fi
+  if [ ! -f "$canonical" ] && [ ! -f "$resolved" ]; then
+    marker "<!-- unfold:missing path=\"$mp\" — not found -->"
+    warn "missing import: @$path (resolved: $resolved)"
+    return
+  fi
+
+  # Amplification budget: a wide+deep lattice expands combinatorially (the
+  # cycle guard only blocks ancestors, not re-use). Cap total files and bytes.
+  if [ "$FILE_COUNT" -ge "$MAX_FILES" ] || [ "$TOTAL_BYTES" -ge "$MAX_BYTES" ]; then
+    BUDGET_HIT=1
+    marker "<!-- unfold:budget path=\"$mp\" — expansion budget reached, not expanded -->"
+    warn "budget reached (--max-files $MAX_FILES / --max-bytes $MAX_BYTES) — further imports not expanded"
+    return
+  fi
+  FILE_COUNT=$((FILE_COUNT + 1))
+
+  local file="$canonical"; [ -f "$file" ] || file="$resolved"
+  marker "<!-- unfold:begin depth=$depth path=\"$mp\" -->"
+  account "$depth" "@$path" "$file"
+  ON_PATH[$canonical]=1
+  walk_file "$file" "$depth"
+  unset 'ON_PATH[$canonical]'
+  marker "<!-- unfold:end path=\"$mp\" -->"
+}
+
+# Read a file line by line, tracking fenced-code state, expanding imports.
+walk_file() {
+  local file="$1" depth="$2"
+  local base_dir; base_dir=$(cd "$(dirname "$file")" 2>/dev/null && pwd -P) || base_dir=$(dirname "$file")
+  local in_fence=0 fence_char="" line stripped fc
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Fenced-code detection (heuristic). Strip leading whitespace so a fence
+    # nested under a list item still counts, and require a matching marker
+    # char to close: a ~~~ line must not close a ``` block, or imports in the
+    # still-open block would be falsely expanded (and trip --strict).
+    stripped="${line#"${line%%[![:space:]]*}"}"
+    case "$stripped" in
+      '```'*|'~~~'*)
+        fc="${stripped:0:1}"
+        if [ "$in_fence" -eq 0 ]; then in_fence=1; fence_char="$fc"
+        elif [ "$fc" = "$fence_char" ]; then in_fence=0; fence_char=""
+        fi
+        printf '%s\n' "$line"; continue ;;
+    esac
+    if [ "$in_fence" -eq 1 ]; then
+      put_content "$line"
+    else
+      expand_line "$line" "$depth" "$base_dir"
+    fi
+  done <"$file"
+}
+
+print_footer() {
+  [ "$FOOTER" -eq 1 ] || return
+  [ "$BARE" -eq 1 ] && return
+  local tokens=$(( (TOTAL_CHARS + 3) / 4 ))
+  printf '\n'
+  printf '<!-- unfold:summary\n'
+  printf '  %-6s %-44s %8s %8s\n' "depth" "file" "chars" "bytes"
+  local row d label c b indent
+  for row in "${REPORT[@]}"; do
+    IFS=$'\t' read -r d label c b <<<"$row"
+    indent=$(printf '%*s' $((d * 2)) '')
+    printf '  %-6s %-44s %8s %8s\n' "$d" "$(msan "$indent$label")" "$c" "$b"
+  done
+  printf '  %-6s %-44s %8s %8s\n' "" "TOTAL" "$TOTAL_CHARS" "$TOTAL_BYTES"
+  printf '  ~%s tokens (chars/4 heuristic)' "$tokens"
+  [ "$WARN_COUNT" -gt 0 ] && printf '  ·  %s warning(s) — see stderr' "$WARN_COUNT"
+  printf '\n-->\n'
+}
+
+main() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --bare) BARE=1 ;;
+      --no-footer) FOOTER=0 ;;
+      --strict) STRICT=1 ;;
+      --max-depth) shift; [ $# -gt 0 ] || die "--max-depth needs a number"
+                   case "$1" in (*[!0-9]*|'') die "--max-depth: not a number: $1";; esac
+                   MAX_DEPTH="$1" ;;
+      --max-files) shift; [ $# -gt 0 ] || die "--max-files needs a number"
+                   case "$1" in (*[!0-9]*|'') die "--max-files: not a number: $1";; esac
+                   MAX_FILES="$1" ;;
+      --max-bytes) shift; [ $# -gt 0 ] || die "--max-bytes needs a number"
+                   case "$1" in (*[!0-9]*|'') die "--max-bytes: not a number: $1";; esac
+                   MAX_BYTES="$1" ;;
+      --no-escape) NO_ESCAPE=1 ;;
+      -h|--help) usage; exit 0 ;;
+      --version) printf 'unfold %s\n' "$VERSION"; exit 0 ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1 (try --help)" ;;
+      *) [ -z "$TARGET" ] || die "unexpected argument: $1"; TARGET="$1" ;;
+    esac
+    shift
+  done
+  # Post-`--` positionals: accept at most one, and only if none seen yet —
+  # silently ignoring extras could make a security tool review the wrong file.
+  if [ $# -gt 0 ]; then
+    [ -z "$TARGET" ] || die "unexpected argument: $1"
+    TARGET="$1"; shift
+    [ $# -eq 0 ] || die "unexpected extra argument: $1"
+  fi
+
+  [ -n "$TARGET" ] || TARGET="./CLAUDE.md"
+  if [ -d "$TARGET" ]; then TARGET="${TARGET%/}/CLAUDE.md"; fi
+  [ -f "$TARGET" ] || die "not found: $TARGET"
+
+  ROOT_DIR=$(dirname "$(canon "$TARGET")")
+  local root_canon; root_canon=$(canon "$TARGET")
+  marker "<!-- unfold:begin depth=0 path=\"$TARGET\" (root) -->"
+  account 0 "$TARGET" "$TARGET"
+  ON_PATH[$root_canon]=1
+  walk_file "$TARGET" 0
+  marker "<!-- unfold:end path=\"$TARGET\" -->"
+  print_footer
+
+  if [ "$STRICT" -eq 1 ] && [ "$WARN_COUNT" -gt 0 ]; then exit 2; fi
+  exit 0
+}
+
+main "$@"

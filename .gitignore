@@ -1,0 +1,23 @@
+# Workspace policy — never commit local-only project notes.
+CLAUDE.md
+STATE.md
+SPEC.md
+SPEC*.md
+0[0-9]-*.md
+adrs/
+
+# Claude Code per-project settings + hook tree (local).
+.claude/
+
+# Local scratch / editor / OS noise
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local test sandboxes (used by ad-hoc smoke tests)
+tmp/
+*.tsv.local
+
+# Logs
+*.log
