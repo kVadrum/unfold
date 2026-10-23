@@ -21,3 +21,9 @@ tmp/
 
 # Logs
 *.log
+
+# Wrapper-managed state file: indicates origin push is failing
+ops/autonomous/.push-broken
+
+# Run-log scratch file — local-only, like STATE.md
+RUNLOG.md
